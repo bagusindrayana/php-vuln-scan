@@ -10,6 +10,18 @@ DEFAULT_CONFIG_DIRS=(
     /opt/cpanel/ea-nginx
 )
 CONFIG_DIRS=("${DEFAULT_CONFIG_DIRS[@]}")
+CUSTOM_CONFIG_DIRS=()
+SCAN_RECORDS_FILE=""
+TEMP_DROPIN_FILE=""
+
+cleanup() {
+    local exit_code=$?
+    [[ -n "$SCAN_RECORDS_FILE" && -f "$SCAN_RECORDS_FILE" ]] && rm -f "$SCAN_RECORDS_FILE"
+    [[ -n "$TEMP_DROPIN_FILE" && -f "$TEMP_DROPIN_FILE" ]] && rm -f "$TEMP_DROPIN_FILE"
+    exit "$exit_code"
+}
+trap cleanup EXIT INT TERM HUP
+
 DOMAINS=()
 LABELS=()
 VERSIONS=()
@@ -92,11 +104,11 @@ ui_warning() {
 format_status() {
     local status="$1" enabled="${2:-0}" code=0
     case "$status" in
-        AFFECTED) code=31 ;;
+        AFFECTED*) code=31 ;;
         FIXED) code=32 ;;
         NOT\ AFFECTED*) code=32 ;;
         VERSION\ CONFLICT|UNKNOWN*) code=33 ;;
-        REQUIRES\ ADVISORY\ VERIFICATION) code=35 ;;
+        REQUIRES\ ADVISORY\ VERIFICATION*) code=35 ;;
     esac
     if ((code)); then
         ui_style "1;${code}" "$status" "$enabled"
@@ -123,10 +135,10 @@ print_table_status_cell() {
     local status="$1" width="$2" color="$3" text="$1" code=0 padding
     [[ "$text" == "NOT AFFECTED"* ]] && text="NOT AFFECTED"
     case "$status" in
-        AFFECTED) code=31 ;;
+        AFFECTED*) code=31 ;;
         FIXED|"NOT AFFECTED"*) code=32 ;;
         VERSION\ CONFLICT|UNKNOWN*) code=33 ;;
-        REQUIRES\ ADVISORY\ VERIFICATION) code=35 ;;
+        REQUIRES\ ADVISORY\ VERIFICATION*) code=35 ;;
     esac
     if [[ "$color" == 1 && "$code" != 0 ]]; then
         printf '\033[1;%sm%s\033[0m' "$code" "$text"
@@ -181,6 +193,7 @@ while (($#)); do
                 exit 2
             fi
             CONFIG_DIRS+=("$2")
+            CUSTOM_CONFIG_DIRS+=("$2")
             shift 2
             ;;
         -h|--help)
@@ -196,34 +209,76 @@ while (($#)); do
 done
 
 php_version_from_label() {
-    local label="${1,,}" digits
-    if [[ "$label" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    local label="${1,,}" digits cleaned
+    # Remove IPv4 addresses (e.g. 127.0.0.1:9000 -> :9000) so that 127.0.0 is not mistaken for a PHP version
+    cleaned="$label"
+    while [[ "$cleaned" =~ ([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})(:[0-9]+)? ]]; do
+        cleaned="${cleaned//${BASH_REMATCH[0]}/}"
+    done
+
+    if [[ "$cleaned" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
         printf '%s.%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
-    elif [[ "$label" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+    elif [[ "$cleaned" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
         printf '%d.%d\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))"
     elif [[ "$label" =~ ea-php([0-9]{2,3}) ]]; then
         digits="${BASH_REMATCH[1]}"
         printf '%d.%d\n' "$((10#${digits:0:${#digits}-1}))" "$((10#${digits: -1}))"
-    elif [[ "$label" =~ php([0-9]+)\.([0-9]+) ]]; then
+    elif [[ "$cleaned" =~ php([0-9]+)\.([0-9]+) ]]; then
         printf '%d.%d\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))"
-    elif [[ "$label" =~ php([0-9]{2,3})(-fpm|[^0-9]|$) ]]; then
+    elif [[ "$cleaned" =~ php([0-9]{2,3})(-fpm|[^0-9]|$) ]]; then
         digits="${BASH_REMATCH[1]}"
         printf '%d.%d\n' "$((10#${digits:0:${#digits}-1}))" "$((10#${digits: -1}))"
     fi
 }
 
+find_fpm_from_listener() {
+    local endpoint="$1" pid="" exe="" port="" socket=""
+    if [[ "$endpoint" =~ :([0-9]+) ]]; then
+        port="${BASH_REMATCH[1]}"
+        if command -v ss >/dev/null 2>&1; then
+            pid="$(ss -tlpn "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -n 1 | cut -d= -f2 || true)"
+        fi
+        if [[ -z "$pid" ]] && command -v lsof >/dev/null 2>&1; then
+            pid="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $2; exit}' || true)"
+        fi
+    elif [[ "$endpoint" == *unix:* || "$endpoint" == *.sock* ]]; then
+        socket="${endpoint#*unix:}"
+        socket="${socket%%|*}"
+        socket="${socket%% *}"
+        socket="${socket%%\"*}"
+        socket="${socket%%;*}"
+        if [[ -S "$socket" ]]; then
+            if command -v ss >/dev/null 2>&1; then
+                pid="$(ss -xlpn "src = $socket" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -n 1 | cut -d= -f2 || true)"
+            fi
+            if [[ -z "$pid" ]] && command -v lsof >/dev/null 2>&1; then
+                pid="$(lsof -Fp "$socket" 2>/dev/null | grep -oE '[0-9]+' | head -n 1 || true)"
+            fi
+        fi
+    fi
+
+    if [[ -n "$pid" && -d "/proc/$pid" ]]; then
+        exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+        if [[ -x "$exe" ]]; then
+            printf '%s\n' "$exe"
+            return
+        fi
+    fi
+}
+
 resolve_php() {
-    local label="$1" hint executable output digits fpm_version
+    local label="$1" path_hint="${2:-}" hint executable output digits fpm_version listener_exe
     RESOLVED_VERSION=""
     RESOLVED_PATH=""
 
-    if [[ ${VERSION_CACHE[$label]+present} ]]; then
+    if [[ ${VERSION_CACHE[$label]+present} && -n "${VERSION_CACHE[$label]}" ]]; then
         RESOLVED_VERSION="${VERSION_CACHE[$label]}"
         RESOLVED_PATH="${PATH_CACHE[$label]-}"
         return
     fi
 
     hint="$(php_version_from_label "$label" || true)"
+    [[ -n "$hint" ]] || hint="$(php_version_from_label "$path_hint" || true)"
 
     if [[ "$label" == "apache-mod-php" ]]; then
         # Apache mod_php does not expose its PHP version in a vhost directive.
@@ -263,6 +318,17 @@ resolve_php() {
                 fi
             fi
         done
+
+        if [[ -z "$RESOLVED_VERSION" && -n "$path_hint" ]]; then
+            listener_exe="$(find_fpm_from_listener "$path_hint" || true)"
+            if [[ -n "$listener_exe" && -x "$listener_exe" ]]; then
+                output="$("$listener_exe" -v 2>/dev/null | head -n 1 || true)"
+                if [[ "$output" =~ PHP[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+                    RESOLVED_VERSION="${BASH_REMATCH[1]}"
+                    RESOLVED_PATH="$listener_exe"
+                fi
+            fi
+        fi
 
         if [[ -z "$RESOLVED_VERSION" ]]; then
             fpm_version="$(running_fpm_version || true)"
@@ -336,6 +402,10 @@ classify_version() {
         major=$((10#${BASH_REMATCH[1]}))
         minor=$((10#${BASH_REMATCH[2]}))
         patch=$((10#${BASH_REMATCH[3]}))
+    elif [[ "$version" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+        major=$((10#${BASH_REMATCH[1]}))
+        minor=$((10#${BASH_REMATCH[2]}))
+        patch=-1
     else
         echo "UNKNOWN"
         return
@@ -344,15 +414,39 @@ classify_version() {
     if ((major < 5 || (major == 5 && minor < 4))); then
         echo "NOT AFFECTED (below project version boundary)"
     elif ((major < 8 || (major == 8 && minor < 2))); then
-        echo "AFFECTED"
+        echo "AFFECTED (EOL / unsupported)"
     elif ((major == 8 && minor == 2)); then
-        ((patch < 35)) && echo "AFFECTED" || echo "FIXED"
+        if ((patch == -1)); then
+            echo "REQUIRES ADVISORY VERIFICATION"
+        elif ((patch < 35)); then
+            echo "AFFECTED"
+        else
+            echo "FIXED"
+        fi
     elif ((major == 8 && minor == 3)); then
-        ((patch < 36)) && echo "AFFECTED" || echo "FIXED"
+        if ((patch == -1)); then
+            echo "REQUIRES ADVISORY VERIFICATION"
+        elif ((patch < 36)); then
+            echo "AFFECTED"
+        else
+            echo "FIXED"
+        fi
     elif ((major == 8 && minor == 4)); then
-        ((patch < 27)) && echo "AFFECTED" || echo "FIXED"
+        if ((patch == -1)); then
+            echo "REQUIRES ADVISORY VERIFICATION"
+        elif ((patch < 27)); then
+            echo "AFFECTED"
+        else
+            echo "FIXED"
+        fi
     elif ((major == 8 && minor == 5)); then
-        ((patch < 12)) && echo "AFFECTED" || echo "FIXED"
+        if ((patch == -1)); then
+            echo "REQUIRES ADVISORY VERIFICATION"
+        elif ((patch < 12)); then
+            echo "AFFECTED"
+        else
+            echo "FIXED"
+        fi
     else
         echo "REQUIRES ADVISORY VERIFICATION"
     fi
@@ -397,7 +491,7 @@ php_label_from_endpoint() {
 
 find_php_fpm_executable() {
     local label="$1" endpoint="$2" resolved_path="$3"
-    local hint digits executable
+    local hint digits executable listener_exe
     local candidates=()
 
     if [[ "$resolved_path" == *php-fpm* && -x "${resolved_path%% (*}" ]]; then
@@ -429,6 +523,12 @@ find_php_fpm_executable() {
     for executable in "${candidates[@]}"; do
         [[ -x "$executable" ]] && { printf '%s\n' "$executable"; return; }
     done
+
+    listener_exe="$(find_fpm_from_listener "$endpoint" || true)"
+    if [[ -n "$listener_exe" && -x "$listener_exe" ]]; then
+        printf '%s\n' "$listener_exe"
+        return
+    fi
 
     if [[ -n "$FPM_VERSION_PATH" && -x "$FPM_VERSION_PATH" ]]; then
         printf '%s\n' "$FPM_VERSION_PATH"
@@ -536,7 +636,7 @@ add_domain() {
     local version status path upload_status upload_source version_key i
     [[ -n "$domain" ]] || return
 
-    resolve_php "$label"
+    resolve_php "$label" "$path_hint"
     version="$RESOLVED_VERSION"
     path="${path_hint:-$RESOLVED_PATH}"
     check_upload_progress "$label" "$path_hint" "$RESOLVED_PATH"
@@ -708,9 +808,65 @@ detect_apache_mod_php() {
     done
 }
 
+resolve_included_fastcgi() {
+    local inc_list="$1" config_file="$2" inc item candidate
+    local base_dir="${config_file%/*}"
+    for inc in $inc_list; do
+        [[ -n "$inc" ]] || continue
+        local check_paths=()
+        if [[ "$inc" == /* ]]; then
+            check_paths+=("$inc")
+        else
+            check_paths+=(
+                "/etc/nginx/$inc"
+                "/etc/nginx/conf.d/$inc"
+                "$base_dir/$inc"
+                "/usr/local/etc/nginx/$inc"
+            )
+        fi
+        for candidate in "${check_paths[@]}"; do
+            for item in $candidate; do
+                if [[ -f "$item" ]]; then
+                    local found_pass
+                    found_pass="$(grep -E '^[[:space:]]*fastcgi_pass[[:space:]]' "$item" 2>/dev/null | head -n 1 | awk '{sub(/[;[:space:]].*$/, "", $2); print $2}' || true)"
+                    if [[ -n "$found_pass" ]]; then
+                        printf '%s\n' "$found_pass"
+                        return
+                    fi
+                fi
+            done
+        done
+    done
+}
+
+resolve_upstream_endpoint() {
+    local name="$1" conf_dir match u_file target
+    [[ "$name" =~ ^[a-zA-Z0-9_.-]+$ ]] || return
+    [[ "$name" == *"/"* || "$name" == *":"* ]] && return
+
+    for conf_dir in "${CONFIG_DIRS[@]}"; do
+        [[ -d "$conf_dir" ]] || continue
+        match="$(grep -rnE "^[[:space:]]*upstream[[:space:]]+$name[[:space:]]*\{" "$conf_dir" 2>/dev/null | head -n 1 || true)"
+        if [[ -n "$match" ]]; then
+            u_file="${match%%:*}"
+            target="$(awk -v up="$name" '
+                $0 ~ "^[[:space:]]*upstream[[:space:]]+" up "[[:space:]]*\\{" { in_up=1; next }
+                in_up && $1 == "server" { sub(/[;[:space:]].*$/, "", $2); print $2; exit }
+                in_up && /}/ { exit }
+            ' "$u_file" 2>/dev/null || true)"
+            if [[ -n "$target" ]]; then
+                printf '%s\n' "$target"
+                return
+            fi
+        fi
+    done
+}
+
 scan_configs() {
     local config domain endpoint source label path_hint directory apache_mod_php
     local records_file file_count=0 total=0 processed=0
+    local target_dirs=("$@")
+    (( ${#target_dirs[@]} )) || target_dirs=("${CONFIG_DIRS[@]}")
     declare -A scan_domain_seen=()
     declare -A processed_domain_seen=()
     detect_apache_mod_php
@@ -720,37 +876,58 @@ scan_configs() {
         ui_warning "Could not create a temporary scan record file."
         return 1
     fi
+    SCAN_RECORDS_FILE="$records_file"
 
-    for directory in "${CONFIG_DIRS[@]}"; do
+    for directory in "${target_dirs[@]}"; do
         [[ -d "$directory" ]] || continue
         echo "  Reading configuration files under: $directory"
         while IFS= read -r -d '' config; do
             file_count=$((file_count + 1))
             show_collection_progress "$file_count"
             awk -v apache_mod_php="$apache_mod_php" '
-                function flush_nginx(    names, endpoint, i, n, fields) {
+                function flush_nginx(    names, endpoint, includes, in_server_name, i, n, fields, line) {
                     if (block == "") return
                     names = ""
                     endpoint = ""
+                    includes = ""
+                    in_server_name = 0
                     n = split(block, lines, "\n")
                     for (i = 1; i <= n; i++) {
                         line = lines[i]
                         sub(/#.*/, "", line)
-                        if (line ~ /^[[:space:]]*server_name[[:space:]]/) {
+                        if (in_server_name) {
+                            if (line ~ /;/) {
+                                sub(/[;].*$/, "", line)
+                                names = names " " line
+                                in_server_name = 0
+                            } else {
+                                names = names " " line
+                            }
+                        } else if (line ~ /^[[:space:]]*server_name[[:space:]]/) {
                             sub(/^[[:space:]]*server_name[[:space:]]+/, "", line)
-                            sub(/[;].*$/, "", line)
-                            names = names " " line
+                            if (line ~ /;/) {
+                                sub(/[;].*$/, "", line)
+                                names = names " " line
+                            } else {
+                                names = names " " line
+                                in_server_name = 1
+                            }
                         }
                         if (line ~ /^[[:space:]]*fastcgi_pass[[:space:]]/) {
                             sub(/^[[:space:]]*fastcgi_pass[[:space:]]+/, "", line)
                             sub(/[;[:space:]].*$/, "", line)
                             endpoint = endpoint " " line
                         }
+                        if (line ~ /^[[:space:]]*include[[:space:]]/) {
+                            sub(/^[[:space:]]*include[[:space:]]+/, "", line)
+                            sub(/[;[:space:]].*$/, "", line)
+                            includes = includes " " line
+                        }
                     }
                     n = split(names, fields, /[[:space:]]+/)
                     for (i = 1; i <= n; i++)
                         if (fields[i] != "" && fields[i] != "_" && fields[i] !~ /\$/)
-                            print fields[i] "\t" endpoint
+                            print fields[i] "\t" endpoint "\t" includes
                     block = ""
                 }
                 {
@@ -760,10 +937,24 @@ scan_configs() {
                     if ((lower_line ~ /loadmodule/ && lower_line ~ /(php|libphp)/) ||
                         lower_line ~ /(addhandler|sethandler|addtype).*application\/x-httpd-php/)
                         apache_global_php = 1
-                    if (!in_server && line ~ /^[[:space:]]*server[[:space:]]*\{/) {
-                        in_server = 1
-                        depth = 0
-                        block = ""
+                    if (!in_server) {
+                        if (line ~ /^[[:space:]]*server[[:space:]]*\{/) {
+                            in_server = 1
+                            depth = 0
+                            block = ""
+                        } else if (line ~ /^[[:space:]]*server[[:space:]]*$/) {
+                            pending_server = 1
+                            next
+                        } else if (pending_server) {
+                            if (line ~ /^[[:space:]]*\{/) {
+                                in_server = 1
+                                depth = 0
+                                block = ""
+                                pending_server = 0
+                            } else {
+                                pending_server = 0
+                            }
+                        }
                     }
                     if (in_server) {
                         block = block line "\n"
@@ -802,7 +993,7 @@ scan_configs() {
                             n = split(names, fields, /[[:space:]]+/)
                             for (i = 1; i <= n; i++)
                                 if (fields[i] != "" && fields[i] !~ /\$/)
-                                    print fields[i] "\t" endpoint
+                                    print fields[i] "\t" endpoint "\t" ""
                             in_vhost = 0
                             apache = ""
                         }
@@ -812,8 +1003,18 @@ scan_configs() {
                     if (in_server) flush_nginx()
                 }
             ' "$config" |
-                while IFS=$'\t' read -r domain endpoint; do
+                while IFS=$'\t' read -r domain endpoint includes; do
                     [[ -n "$domain" ]] || continue
+                    if [[ -z "$endpoint" && -n "$includes" ]]; then
+                        local resolved_inc
+                        resolved_inc="$(resolve_included_fastcgi "$includes" "$config")"
+                        [[ -n "$resolved_inc" ]] && endpoint="$resolved_inc"
+                    fi
+                    if [[ -n "$endpoint" && ! "$endpoint" =~ [/:.] ]]; then
+                        local upstream_target
+                        upstream_target="$(resolve_upstream_endpoint "$endpoint")"
+                        [[ -n "$upstream_target" ]] && endpoint="$upstream_target"
+                    fi
                     printf '%s\t%s\t%s\n' "$domain" "$endpoint" "$config"
                 done >> "$records_file"
         done < <(
@@ -836,6 +1037,7 @@ scan_configs() {
 
     if ((total == 0)); then
         rm -f "$records_file"
+        SCAN_RECORDS_FILE=""
         return 0
     fi
     echo "  Detected $total unique domain(s); checking PHP runtime settings..."
@@ -851,6 +1053,7 @@ scan_configs() {
         fi
     done < "$records_file"
     rm -f "$records_file"
+    SCAN_RECORDS_FILE=""
 }
 
 detect_default_cli_php() {
@@ -1065,12 +1268,15 @@ session.upload_progress.enabled = 0
             ui_warning "Could not create a temporary file in $directory."
             continue
         fi
+        TEMP_DROPIN_FILE="$temporary_file"
         if printf '%s' "$content" >"$temporary_file" && chmod 0644 "$temporary_file" && mv -f "$temporary_file" "$target"; then
+            TEMP_DROPIN_FILE=""
             ui_success "Created: $target"
             TEMP_FIX_APPLIED+=("$target")
             applied=$((applied + 1))
         else
             rm -f "$temporary_file"
+            TEMP_DROPIN_FILE=""
             ui_warning "Could not create: $target"
         fi
     done
@@ -1099,12 +1305,17 @@ collect_apt_php_packages() {
 }
 
 collect_rpm_php_packages() {
-    local package major minor
+    local package major minor digits
     while IFS= read -r package; do
         [[ -n "$package" ]] || continue
         if [[ "$package" =~ ^php([0-9])([0-9])-php ]]; then
             major=$((10#${BASH_REMATCH[1]}))
             minor=$((10#${BASH_REMATCH[2]}))
+            ((major > 8 || (major == 8 && minor >= 2))) && printf '%s\n' "$package"
+        elif [[ "$package" =~ ^ea-php([0-9]{2,3})- ]]; then
+            digits="${BASH_REMATCH[1]}"
+            major=$((10#${digits:0:${#digits}-1}))
+            minor=$((10#${digits: -1}))
             ((major > 8 || (major == 8 && minor >= 2))) && printf '%s\n' "$package"
         elif [[ "$package" =~ ^php(-|$) ]]; then
             printf '%s\n' "$package"
@@ -1113,7 +1324,7 @@ collect_rpm_php_packages() {
 }
 
 update_php_packages() {
-    local manager answer package_list package name major minor package_supports_82=0
+    local manager answer package_list package name major minor digits package_supports_82=0
     local packages=()
 
     if ((EUID != 0)); then
@@ -1159,6 +1370,13 @@ update_php_packages() {
             elif [[ "$name" =~ ^php([0-9])([0-9])-php ]]; then
                 major=$((10#${BASH_REMATCH[1]}))
                 minor=$((10#${BASH_REMATCH[2]}))
+                if ((major > 8 || (major == 8 && minor >= 2))); then
+                    package_supports_82=1
+                fi
+            elif [[ "$name" =~ ^ea-php([0-9]{2,3})- ]]; then
+                digits="${BASH_REMATCH[1]}"
+                major=$((10#${digits:0:${#digits}-1}))
+                minor=$((10#${digits: -1}))
                 if ((major > 8 || (major == 8 && minor >= 2))); then
                     package_supports_82=1
                 fi
@@ -1268,16 +1486,19 @@ render_report() {
     draw_bar "Unknown / runtime not mapped" "$upload_unknown" "$total"
 
     ui_heading "PHP VERSION SUMMARY"
-    seen=" "
+    declare -A VERSION_COUNTS=()
+    local unique_versions=()
     for i in "${!DOMAINS[@]}"; do
         version="${VERSIONS[$i]}"
-        [[ "$seen" == *" $version "* ]] && continue
-        seen+="$version "
-        count=0
-        for status in "${VERSIONS[@]}"; do
-            [[ "$status" == "$version" ]] && count=$((count + 1))
-        done
-        draw_bar "PHP ${version:--}" "$count" "$total"
+        if [[ -z ${VERSION_COUNTS[$version]+present} ]]; then
+            VERSION_COUNTS["$version"]=1
+            unique_versions+=("$version")
+        else
+            VERSION_COUNTS["$version"]=$((VERSION_COUNTS["$version"] + 1))
+        fi
+    done
+    for version in "${unique_versions[@]}"; do
+        draw_bar "PHP ${version:--}" "${VERSION_COUNTS[$version]}" "$total"
     done
 
     ui_heading "NOTES"
@@ -1336,12 +1557,18 @@ reset_scan_state() {
 run_scan() {
     reset_scan_state
     ui_heading "SCANNING WHM / NGINX / APACHE"
+    local whm_found=0
     if command -v whmapi1 >/dev/null 2>&1; then
-        if ! collect_whm; then
-            scan_configs
+        if collect_whm; then
+            whm_found=1
         fi
-    else
-        scan_configs
+    fi
+
+    if ((whm_found == 0)); then
+        scan_configs "${CONFIG_DIRS[@]}"
+    elif ((${#CUSTOM_CONFIG_DIRS[@]} > 0)); then
+        ui_info "Scanning additional custom configuration directory(ies)..."
+        scan_configs "${CUSTOM_CONFIG_DIRS[@]}"
     fi
 
     if ((${#DOMAINS[@]} == 0)); then

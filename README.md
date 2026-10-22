@@ -2,7 +2,7 @@
 
 An interactive Bash utility for mapping web domains to PHP versions, checking those versions against the affected/fixed ranges for recent PHP CVEs, and reporting the `session.upload_progress` setting where it can be detected.
 
-The scanner obtains domain/version data from the WHM API when available. Otherwise, it reads Nginx and Apache virtual-host configuration from common configuration directories. Its report includes detected domains, PHP version and status, PHP path or endpoint, data source, runtime upload-progress status, and a server summary.
+The scanner obtains domain/version data from the WHM API when available. Otherwise, it reads Nginx, Apache and LiteSpeed virtual-host configuration from common configuration directories. Its report includes detected domains, PHP version and status, PHP path or endpoint, data source, runtime upload-progress status, and a server summary.
 
 ## CVE background
 
@@ -30,7 +30,28 @@ As of **October 22, 2026**, php.net lists **PHP 8.5.12**, released on October 21
 - Read access to web-server configuration files. Root access may be needed to inspect some server configurations.
 - For WHM discovery: `whmapi1` and either `jq` or Perl with the `JSON::PP` module. If WHM is unavailable or fails, the script falls back to local configuration scanning.
 - PHP CLI and/or PHP-FPM can improve version and runtime-setting detection. Without an identifiable runtime, some results may be `UNKNOWN`.
-- Root access for the optional mitigation and package-update actions. Package updates support `apt`, `dnf`, and `yum`.
+- Root access for the optional mitigation and package-update actions. Package updates support `apt`, `dnf`, `yum`, `zypper`, `apk`, and `pacman`.
+- Service restarts use systemd, or OpenRC when systemd is not running (Alpine).
+
+### Supported distributions
+
+| Family | PHP runtimes detected | Distro backport check | Package update |
+|---|---|---|---|
+| Debian / Ubuntu (official, Sury) | `php8.3`, `php-fpm8.3` | dpkg changelog | `apt-get install --only-upgrade` |
+| RHEL / Alma / Rocky / CentOS / Fedora (+ Remi) | `php`, `php-fpm`, `/opt/remi/php83` | rpm changelog | `dnf` / `yum` |
+| cPanel / WHM (EasyApache) | `ea-php83` | rpm changelog | `dnf` / `yum` |
+| openSUSE / SLES | `php8`, `php-fpm` | rpm changelog | `zypper update` |
+| Alpine | `php83`, `php-fpm83` | — | `apk upgrade` |
+| Arch | `php`, `php-fpm`, AUR `php82` | — | `pacman -Syu` (full system upgrade; Arch does not support partial upgrades) |
+
+Unversioned binaries (`/usr/bin/php`, `/usr/sbin/php-fpm`) are mapped to a domain only when their branch matches the version found in the configuration.
+
+### LiteSpeed
+
+- **OpenLiteSpeed / LiteSpeed native configuration** (`/usr/local/lsws/conf/httpd_config.conf`): domains come from `listener` `map` entries and `vhTemplate` members; each domain is mapped to the `lsphp` binary of its virtual host's PHP script handler (or the server default), and that binary is probed for its version and `session.upload_progress`. A directory passed with `--config-dir` is parsed the same way when it contains `httpd_config.conf`.
+- **LiteSpeed Enterprise in Apache-compatible mode** (cPanel, DirectAdmin) reads the Apache configuration, which is already scanned; on cPanel the WHM API is used.
+- The legacy XML format (`httpd_config.xml`) is not parsed.
+- The temporary fix writes into the directory each `lsphp` scans (for example `lsphp83/etc/php/8.3/mods-available`); `lsphp83-*` packages are included in the package update, and the `lsws` service is offered for restart.
 
 ## Usage
 
@@ -44,7 +65,7 @@ sudo bash check-php.sh
 The interactive menu provides:
 
 1. **Scan domains and PHP versions** — scan and display a report.
-2. **Apply temporary fix** — after confirmation, create PHP configuration drop-ins that set `session.upload_progress.enabled = 0`. Existing files with different contents are not overwritten. The script offers to restart active PHP-FPM/Apache services.
+2. **Apply temporary fix** — after confirmation, create PHP configuration drop-ins that set `session.upload_progress.enabled = 0`. Existing files with different contents are not overwritten. The script offers to restart active PHP-FPM/Apache/LiteSpeed services.
 3. **Update installed PHP 8.2+ packages** — after confirmation, update installed PHP packages using a supported package manager. Review the package list and expected impact before proceeding.
 4. **View/save report** — display the latest scan report and optionally save it as `php-cve-report-<timestamp>.txt` in the current directory.
 5. **Exit** — close the script.
@@ -64,6 +85,8 @@ bash check-php.sh --help
 ## Understanding the report
 
 - `AFFECTED` / `FIXED`: version classification against the thresholds encoded in the script.
+- `AFFECTED (EOL / unsupported)`: the PHP branch (5.4 to 8.1) no longer receives security fixes and is counted as affected in the summary.
+- `FIXED (distro backport)`: the upstream version is affected, but the changelog of the package providing the mapped PHP binary (dpkg or rpm) lists both CVE IDs, as with Sury/Debian/RHEL/SUSE backports that keep the same `PHP_VERSION`. Alpine and Arch packages carry no installed changelog, so they are classified by version only.
 - `NOT AFFECTED`: the version is below the project's affected-version boundary; this is not a substitute for checking the vendor advisory.
 - `UNKNOWN`, `VERSION CONFLICT`, or `REQUIRES ADVISORY VERIFICATION`: the scanner cannot confidently classify the runtime, or the detected version requires manual verification.
 - `session.upload_progress`: reports whether the setting was detected as active, disabled, or unknown for the mapped runtime.

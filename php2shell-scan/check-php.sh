@@ -8,6 +8,7 @@ DEFAULT_CONFIG_DIRS=(
     /usr/local/apache/conf
     /usr/local/etc/nginx
     /opt/cpanel/ea-nginx
+    /usr/local/lsws/conf
 )
 CONFIG_DIRS=("${DEFAULT_CONFIG_DIRS[@]}")
 CUSTOM_CONFIG_DIRS=()
@@ -46,6 +47,8 @@ APACHE_MOD_PHP_DETECTED=0
 TEMP_FIX_TARGETS=()
 TEMP_FIX_APPLIED=()
 SCAN_COMPLETED=0
+RUNTIME_EXECUTABLE=""
+TARGET_CVES=(CVE-2026-109618 CVE-2026-109619)
 
 declare -A VERSION_CACHE=()
 declare -A PATH_CACHE=()
@@ -53,6 +56,8 @@ declare -A STATUS_CACHE=()
 declare -A DOMAIN_INDEX=()
 declare -A UPLOAD_STATUS_CACHE=()
 declare -A UPLOAD_SOURCE_CACHE=()
+declare -A BACKPORT_CACHE=()
+declare -A BINARY_VERSION_CACHE=()
 declare -A TEMP_FIX_TARGET_SEEN=()
 
 ui_color_enabled() {
@@ -105,7 +110,7 @@ format_status() {
     local status="$1" enabled="${2:-0}" code=0
     case "$status" in
         AFFECTED*) code=31 ;;
-        FIXED) code=32 ;;
+        FIXED*) code=32 ;;
         NOT\ AFFECTED*) code=32 ;;
         VERSION\ CONFLICT|UNKNOWN*) code=33 ;;
         REQUIRES\ ADVISORY\ VERIFICATION*) code=35 ;;
@@ -136,7 +141,7 @@ print_table_status_cell() {
     [[ "$text" == "NOT AFFECTED"* ]] && text="NOT AFFECTED"
     case "$status" in
         AFFECTED*) code=31 ;;
-        FIXED|"NOT AFFECTED"*) code=32 ;;
+        FIXED*|"NOT AFFECTED"*) code=32 ;;
         VERSION\ CONFLICT|UNKNOWN*) code=33 ;;
         REQUIRES\ ADVISORY\ VERIFICATION*) code=35 ;;
     esac
@@ -225,10 +230,25 @@ php_version_from_label() {
         printf '%d.%d\n' "$((10#${digits:0:${#digits}-1}))" "$((10#${digits: -1}))"
     elif [[ "$cleaned" =~ php([0-9]+)\.([0-9]+) ]]; then
         printf '%d.%d\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))"
-    elif [[ "$cleaned" =~ php([0-9]{2,3})(-fpm|[^0-9]|$) ]]; then
-        digits="${BASH_REMATCH[1]}"
+    elif [[ "$cleaned" =~ php(-fpm)?([0-9]{2,3})(-fpm|[^0-9]|$) ]]; then
+        # php83 / php-fpm83 (Alpine, Remi, Arch AUR)
+        digits="${BASH_REMATCH[2]}"
         printf '%d.%d\n' "$((10#${digits:0:${#digits}-1}))" "$((10#${digits: -1}))"
     fi
+}
+
+php_binary_version() {
+    local executable="$1" output
+    if [[ ! ${BINARY_VERSION_CACHE[$executable]+present} ]]; then
+        if [[ "$executable" == *php-fpm* || "$executable" == *lsphp* ]]; then
+            output="$("$executable" -v 2>/dev/null | head -n 1 || true)"
+        else
+            output="$("$executable" -r 'echo PHP_VERSION;' 2>/dev/null || true)"
+        fi
+        [[ "$output" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]] && output="${BASH_REMATCH[1]}" || output=""
+        BINARY_VERSION_CACHE["$executable"]="$output"
+    fi
+    [[ -n "${BINARY_VERSION_CACHE[$executable]}" ]] && printf '%s\n' "${BINARY_VERSION_CACHE[$executable]}"
 }
 
 find_fpm_from_listener() {
@@ -268,12 +288,13 @@ find_fpm_from_listener() {
 
 resolve_php() {
     local label="$1" path_hint="${2:-}" hint executable output digits fpm_version listener_exe
+    local cache_key="$label|$path_hint"
     RESOLVED_VERSION=""
     RESOLVED_PATH=""
 
-    if [[ ${VERSION_CACHE[$label]+present} && -n "${VERSION_CACHE[$label]}" ]]; then
-        RESOLVED_VERSION="${VERSION_CACHE[$label]}"
-        RESOLVED_PATH="${PATH_CACHE[$label]-}"
+    if [[ ${VERSION_CACHE[$cache_key]+present} && -n "${VERSION_CACHE[$cache_key]}" ]]; then
+        RESOLVED_VERSION="${VERSION_CACHE[$cache_key]}"
+        RESOLVED_PATH="${PATH_CACHE[$cache_key]-}"
         return
     fi
 
@@ -292,39 +313,37 @@ resolve_php() {
         RESOLVED_VERSION="$label"
     else
         local candidates=()
+        # An endpoint that is itself a PHP binary (LiteSpeed lsphp) is authoritative.
+        [[ "$path_hint" == /* && -f "$path_hint" && -x "$path_hint" ]] && candidates+=("$path_hint")
         if [[ "$label" =~ ^ea-php([0-9]{2,3})$ ]]; then
             candidates+=("/opt/cpanel/$label/root/usr/bin/php" "/usr/local/bin/$label")
         elif [[ "$hint" =~ ^[0-9]+\.[0-9]+$ ]]; then
-            candidates+=("/usr/bin/php$hint" "/usr/local/bin/php$hint")
             digits="${hint/./}"
-            candidates+=("/usr/sbin/php-fpm$hint" "/usr/sbin/php-fpm$digits")
+            # Versioned names (Debian/Ubuntu, Alpine, Arch AUR), then unversioned
+            # system binaries (RHEL, openSUSE, Arch) accepted only if the branch matches.
+            candidates+=(
+                "/usr/bin/php$hint" "/usr/local/bin/php$hint" "/usr/bin/php$digits"
+                "/usr/sbin/php-fpm$hint" "/usr/sbin/php-fpm$digits" "/usr/bin/php-fpm$digits"
+                "/usr/bin/php${hint%%.*}" /usr/bin/php /usr/sbin/php-fpm /usr/bin/php-fpm
+            )
         fi
 
         for executable in "${candidates[@]}"; do
             [[ -x "$executable" ]] || continue
-            if [[ "$executable" == *php-fpm* ]]; then
-                output="$("$executable" -v 2>/dev/null | head -n 1 || true)"
-                if [[ "$output" =~ PHP[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-                    RESOLVED_VERSION="${BASH_REMATCH[1]}"
-                    RESOLVED_PATH="$executable"
-                    break
-                fi
-            else
-                output="$("$executable" -r 'echo PHP_VERSION;' 2>/dev/null || true)"
-                if [[ "$output" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                    RESOLVED_VERSION="$output"
-                    RESOLVED_PATH="$executable"
-                    break
-                fi
-            fi
+            output="$(php_binary_version "$executable" || true)"
+            [[ -n "$output" ]] || continue
+            [[ -z "$hint" || "$output" == "$hint".* ]] || continue
+            RESOLVED_VERSION="$output"
+            RESOLVED_PATH="$executable"
+            break
         done
 
         if [[ -z "$RESOLVED_VERSION" && -n "$path_hint" ]]; then
             listener_exe="$(find_fpm_from_listener "$path_hint" || true)"
             if [[ -n "$listener_exe" && -x "$listener_exe" ]]; then
-                output="$("$listener_exe" -v 2>/dev/null | head -n 1 || true)"
-                if [[ "$output" =~ PHP[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-                    RESOLVED_VERSION="${BASH_REMATCH[1]}"
+                output="$(php_binary_version "$listener_exe" || true)"
+                if [[ -n "$output" ]]; then
+                    RESOLVED_VERSION="$output"
                     RESOLVED_PATH="$listener_exe"
                 fi
             fi
@@ -343,8 +362,8 @@ resolve_php() {
         [[ -n "$RESOLVED_VERSION" || -z "$hint" ]] || RESOLVED_VERSION="$hint"
     fi
 
-    VERSION_CACHE["$label"]="$RESOLVED_VERSION"
-    PATH_CACHE["$label"]="$RESOLVED_PATH"
+    VERSION_CACHE["$cache_key"]="$RESOLVED_VERSION"
+    PATH_CACHE["$cache_key"]="$RESOLVED_PATH"
 }
 
 resolve_version() {
@@ -452,6 +471,33 @@ classify_version() {
     fi
 }
 
+# Distribution packages (Sury, Debian, RHEL, SUSE, cPanel EA) backport fixes without
+# changing PHP_VERSION, so look for the CVE IDs in the owning package changelog.
+backport_fixed() {
+    local executable="${1%% (*}" real package changelog log="" cve
+    [[ -n "$executable" ]] || return 1
+    if [[ ${BACKPORT_CACHE[$executable]+present} ]]; then
+        return "${BACKPORT_CACHE[$executable]}"
+    fi
+    BACKPORT_CACHE["$executable"]=1
+    real="$(readlink -f "$executable" 2>/dev/null || printf '%s' "$executable")"
+
+    if command -v dpkg >/dev/null 2>&1 &&
+       package="$(dpkg -S "$real" 2>/dev/null | head -n 1)" && [[ -n "$package" ]]; then
+        package="${package%%:*}"
+        changelog="/usr/share/doc/$package/changelog.Debian.gz"
+        [[ -r "$changelog" ]] && log="$(gzip -dc "$changelog" 2>/dev/null || true)"
+    elif command -v rpm >/dev/null 2>&1; then
+        log="$(rpm -q --changelog -f "$real" 2>/dev/null || true)"
+    fi
+
+    [[ -n "$log" ]] || return 1
+    for cve in "${TARGET_CVES[@]}"; do
+        [[ "$log" == *"$cve"* ]] || return 1
+    done
+    BACKPORT_CACHE["$executable"]=0
+}
+
 php_path_from_endpoint() {
     local endpoint="$1" path lower
     [[ -n "$endpoint" ]] || return
@@ -486,7 +532,13 @@ php_label_from_endpoint() {
         printf '%s\n' "apache-mod-php"
         return
     fi
-    php_version_from_label "$endpoint" || true
+    local version
+    version="$(php_version_from_label "$endpoint" || true)"
+    if [[ -n "$version" ]]; then
+        printf '%s\n' "$version"
+    elif [[ "$lower" == *lsphp* ]]; then
+        printf '%s\n' "lsphp"
+    fi
 }
 
 find_php_fpm_executable() {
@@ -500,6 +552,7 @@ find_php_fpm_executable() {
     fi
 
     hint="$(php_version_from_label "$endpoint" || true)"
+    [[ -n "$hint" ]] || hint="$(php_version_from_label "$label" || true)"
     if [[ "$label" =~ ^ea-php([0-9]{2,3})$ ]]; then
         digits="${BASH_REMATCH[1]}"
         candidates+=(
@@ -523,6 +576,14 @@ find_php_fpm_executable() {
     for executable in "${candidates[@]}"; do
         [[ -x "$executable" ]] && { printf '%s\n' "$executable"; return; }
     done
+
+    # Unversioned system FPM (RHEL, openSUSE, Arch): only when its branch matches.
+    if [[ "$hint" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        for executable in /usr/sbin/php-fpm /usr/bin/php-fpm; do
+            [[ -x "$executable" && "$(php_binary_version "$executable" || true)" == "$hint".* ]] &&
+                { printf '%s\n' "$executable"; return; }
+        done
+    fi
 
     listener_exe="$(find_fpm_from_listener "$endpoint" || true)"
     if [[ -n "$listener_exe" && -x "$listener_exe" ]]; then
@@ -563,10 +624,10 @@ probe_upload_progress() {
         return
     fi
 
-    if [[ "$executable" == *php-fpm* ]]; then
+    if [[ "$executable" == *php-fpm* || "$executable" == *lsphp* ]]; then
         output="$(run_with_timeout "$executable" -i 2>/dev/null || true)"
         value="$(printf '%s\n' "$output" | awk '$1 == "session.upload_progress.enabled" {print $NF; exit}')"
-        source="PHP-FPM: $executable"
+        [[ "$executable" == *lsphp* ]] && source="LiteSpeed lsphp: $executable" || source="PHP-FPM: $executable"
     else
         value="$(run_with_timeout "$executable" -r 'echo ini_get("session.upload_progress.enabled");' 2>/dev/null || true)"
         source="PHP CLI/mod_php fallback: $executable"
@@ -589,7 +650,8 @@ check_upload_progress() {
 
     if [[ "$label" == "apache-mod-php" ||
           "$endpoint_lower" == *__apache_mod_php__* ||
-          "$endpoint_lower" == *application/x-httpd-php* ]]; then
+          "$endpoint_lower" == *application/x-httpd-php* ||
+          "$resolved_path" == *lsphp* ]]; then
         executable="${resolved_path%% (*}"
     elif [[ "$endpoint_lower" == *fcgi* || "$endpoint_lower" == *fpm* ||
           "$endpoint_lower" == *unix:* || "$label" =~ ^ea-php[0-9]+$ ]]; then
@@ -598,6 +660,7 @@ check_upload_progress() {
         executable="$resolved_path"
     fi
 
+    RUNTIME_EXECUTABLE="$executable"
     if [[ -n "$executable" ]]; then
         probe_upload_progress "$executable"
     else
@@ -648,6 +711,9 @@ add_domain() {
     else
         status="$(classify_version "$version")"
         STATUS_CACHE["$version_key"]="$status"
+    fi
+    if [[ "$status" == AFFECTED* ]] && backport_fixed "$RUNTIME_EXECUTABLE"; then
+        status="FIXED (distro backport)"
     fi
 
     if [[ ${DOMAIN_INDEX[$domain]+present} ]]; then
@@ -839,6 +905,99 @@ resolve_included_fastcgi() {
     done
 }
 
+# OpenLiteSpeed / LiteSpeed native configuration: domains come from listener
+# maps and template members; each vhost (or template, or the server) names a
+# PHP script handler whose extprocessor path is the lsphp binary.
+# Prints: domain <TAB> lsphp path <TAB> configuration file.
+collect_litespeed_records() {
+    local conf_dir="${1%/}"
+    awk -v root="${conf_dir%/conf}" -v main="$conf_dir/httpd_config.conf" '
+        function resolve(p, vh) {
+            gsub(/\$SERVER_ROOT\/?/, root "/", p)
+            gsub(/\$VH_NAME/, vh, p)
+            if (p !~ /^\//) p = root "/" p
+            gsub(/\/+/, "/", p)
+            return p
+        }
+        function parse(file, scope,    line, depth, head, key, value, kind, name, n, parts, words) {
+            depth = 0
+            while ((getline line < file) > 0) {
+                sub(/#.*/, "", line)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+                if (line == "") continue
+                if (line ~ /\{$/) {
+                    sub(/[[:space:]]*\{$/, "", line)
+                    heads[++depth] = line
+                    if (scope == "" && depth == 2 && tolower(heads[1]) ~ /^vhtemplate[[:space:]]/ && tolower(line) ~ /^member[[:space:]]/)
+                        add_member(heads[1], line)
+                    continue
+                }
+                if (line == "}") { if (depth > 0) depth--; continue }
+                # LiteSpeed keywords are case-insensitive (scriptHandler, extProcessor).
+                key = line; sub(/[[:space:]].*$/, "", key); key = tolower(key)
+                value = line; sub(/^[^[:space:]]+[[:space:]]*/, "", value)
+                split(heads[1], words, /[[:space:]]+/)
+                kind = tolower(words[1]); name = words[2]
+                if (depth == 1 && kind == "extprocessor" && key == "path")
+                    proc[scope SUBSEP name] = value
+                else if (depth == 1 && kind == "scripthandler" && key == "add") {
+                    n = split(value, parts, /[[:space:]]+/)
+                    if (n >= 2 && ("," parts[2] ",") ~ /,php,/) {
+                        sub(/^[^:]*:/, "", parts[1])
+                        handler[scope] = parts[1]
+                    }
+                } else if (scope == "" && depth == 1 && kind == "virtualhost" && key == "configfile")
+                    vhconf[name] = value
+                else if (scope == "" && depth == 1 && kind == "listener" && key == "map") {
+                    n = value; sub(/[[:space:]].*$/, "", n)
+                    sub(/^[^[:space:]]+[[:space:]]*/, "", value)
+                    domains[n] = domains[n] "," value
+                } else if (scope == "" && depth == 1 && kind == "vhtemplate" && key == "templatefile")
+                    tplfile[name] = value
+                else if (scope == "" && depth == 1 && kind == "vhtemplate" && key == "member")
+                    add_member(heads[1], "member " value)
+                else if (scope == "" && depth == 2 && kind == "vhtemplate" && (key == "vhdomain" || key == "vhaliases")) {
+                    split(heads[2], words, /[[:space:]]+/)
+                    member_domains[words[2]] = member_domains[words[2]] "," value
+                }
+            }
+            close(file)
+        }
+        function add_member(template_head, member_head,    words) {
+            split(template_head, words, /[[:space:]]+/)
+            template = words[2]
+            split(member_head, words, /[[:space:]]+/)
+            member_template[words[2]] = template
+        }
+        function emit(list, scope, fallback_name, file,    h, path, n, i, names) {
+            h = (scope in handler) ? handler[scope] : handler[""]
+            path = ""
+            if ((scope SUBSEP h) in proc) path = proc[scope SUBSEP h]
+            else if (("" SUBSEP h) in proc) path = proc["" SUBSEP h]
+            path = (path != "") ? resolve(path, fallback_name) : "-"
+            n = split(list, names, /[,[:space:]]+/)
+            for (i = 1; i <= n; i++)
+                if (names[i] != "" && names[i] != "*" && names[i] !~ /\$/)
+                    print names[i] "\t" path "\t" file
+        }
+        BEGIN {
+            parse(main, "")
+            for (vh in vhconf) {
+                vhconf[vh] = resolve(vhconf[vh], vh)
+                parse(vhconf[vh], "vh:" vh)
+            }
+            for (t in tplfile) {
+                tplfile[t] = resolve(tplfile[t], t)
+                parse(tplfile[t], "tpl:" t)
+            }
+            for (vh in domains)
+                emit(domains[vh], (vh in vhconf) ? "vh:" vh : "", vh, (vh in vhconf) ? vhconf[vh] : main)
+            for (m in member_template)
+                emit((m in member_domains) ? member_domains[m] : m, "tpl:" member_template[m], m, main)
+        }
+    '
+}
+
 resolve_upstream_endpoint() {
     local name="$1" conf_dir match u_file target
     [[ "$name" =~ ^[a-zA-Z0-9_.-]+$ ]] || return
@@ -881,6 +1040,10 @@ scan_configs() {
     for directory in "${target_dirs[@]}"; do
         [[ -d "$directory" ]] || continue
         echo "  Reading configuration files under: $directory"
+        if [[ -r "$directory/httpd_config.conf" ]]; then
+            collect_litespeed_records "$directory" >> "$records_file"
+            continue
+        fi
         while IFS= read -r -d '' config; do
             file_count=$((file_count + 1))
             show_collection_progress "$file_count"
@@ -1060,6 +1223,11 @@ detect_default_cli_php() {
     ((CLI_PHP_SCANNED)) && return
     CLI_PHP_SCANNED=1
     CLI_PHP_PATH="$(command -v php 2>/dev/null || true)"
+    if [[ -z "$CLI_PHP_PATH" ]]; then
+        # Alpine (php83) and openSUSE (php8) may not install an unversioned php.
+        CLI_PHP_PATH="$(compgen -c php | grep -E '^php[0-9][0-9.]*$' | sort -uV | tail -n 1 || true)"
+        [[ -n "$CLI_PHP_PATH" ]] && CLI_PHP_PATH="$(command -v "$CLI_PHP_PATH" 2>/dev/null || true)"
+    fi
     if [[ -z "$CLI_PHP_PATH" || ! -x "$CLI_PHP_PATH" ]]; then
         CLI_UPLOAD_PROGRESS="UNKNOWN"
         CLI_UPLOAD_SOURCE="No default CLI PHP executable found"
@@ -1076,6 +1244,9 @@ detect_default_cli_php() {
         fi
     fi
     CLI_PHP_STATUS="$(classify_version "$CLI_PHP_VERSION")"
+    if [[ "$CLI_PHP_STATUS" == AFFECTED* ]] && backport_fixed "$CLI_PHP_PATH"; then
+        CLI_PHP_STATUS="FIXED (distro backport)"
+    fi
     probe_upload_progress "$CLI_PHP_PATH"
     CLI_UPLOAD_PROGRESS="$UPLOAD_RESULT"
     CLI_UPLOAD_SOURCE="$UPLOAD_SOURCE"
@@ -1112,14 +1283,11 @@ server_summary() {
     else
         echo "Control panel   : cPanel/WHM not detected"
     fi
-    local found=0 service state
-    for service in nginx httpd apache2; do
-        if command -v systemctl >/dev/null 2>&1; then
-            state="$(systemctl is-active "$service" 2>/dev/null || true)"
-            if [[ "$state" == active ]]; then
-                echo "Web server      : $service (active)"
-                found=1
-            fi
+    local found=0 service
+    for service in nginx httpd apache2 lsws; do
+        if service_is_active "$service"; then
+            echo "Web server      : $service (active)"
+            found=1
         fi
     done
     ((found)) || echo "Web server      : service status not detected"
@@ -1145,7 +1313,7 @@ add_temp_fix_target() {
 }
 
 discover_temp_fix_targets() {
-    local root directory ini_dir
+    local root directory ini_dir executable
     TEMP_FIX_TARGETS=()
     TEMP_FIX_TARGET_SEEN=()
 
@@ -1161,7 +1329,8 @@ discover_temp_fix_targets() {
         add_temp_fix_target "$directory"
     done
 
-    for root in /etc/php /etc/opt/remi /opt/remi; do
+    # /etc/php[0-9]*: openSUSE (php8), Alpine (php83), Arch AUR (php82)
+    for root in /etc/php /etc/php[0-9]* /etc/opt/remi /opt/remi; do
         [[ -d "$root" ]] || continue
         while IFS= read -r -d '' directory; do
             add_temp_fix_target "$directory"
@@ -1177,33 +1346,70 @@ discover_temp_fix_targets() {
                 awk -F': ' '/Scan for additional \.ini files in:/ {print $2}'
         )
     fi
+
+    # LiteSpeed lsphp scans its own directory (mods-available on Debian builds).
+    for executable in /usr/local/lsws/lsphp*/bin/lsphp; do
+        [[ -x "$executable" ]] || continue
+        while IFS= read -r ini_dir; do
+            add_temp_fix_target "${ini_dir%/}"
+        done < <(
+            run_with_timeout "$executable" -i 2>/dev/null |
+                awk -F' => ' '$1 == "Scan this dir for additional .ini files" {print $2}'
+        )
+    done
+}
+
+systemd_running() {
+    command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
+}
+
+# OpenRC covers Alpine and other non-systemd hosts.
+service_is_active() {
+    if systemd_running; then
+        systemctl is-active --quiet "$1" 2>/dev/null
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service --exists "$1" 2>/dev/null && rc-service "$1" status >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+restart_service() {
+    if systemd_running; then
+        systemctl restart "$1"
+    else
+        rc-service "$1" restart
+    fi
 }
 
 restart_runtime_services() {
     local service
     local services=()
 
-    if ! command -v systemctl >/dev/null 2>&1; then
-        ui_warning "systemctl is unavailable; restart PHP/web services manually for the change to take effect."
+    if systemd_running; then
+        while IFS= read -r service; do
+            [[ -n "$service" ]] && services+=("$service")
+        done < <(
+            systemctl list-units --type=service --state=active --no-legend 2>/dev/null |
+                awk '$1 ~ /^(php.*fpm|httpd|apache2|lshttpd|lsws)\.service$/ {print $1}'
+        )
+    elif command -v rc-service >/dev/null 2>&1; then
+        while IFS= read -r service; do
+            service_is_active "$service" && services+=("$service")
+        done < <(rc-service --list 2>/dev/null | grep -E '^(php.*fpm.*|httpd|apache2|lshttpd|lsws)$')
+    else
+        ui_warning "Neither systemd nor OpenRC is available; restart PHP/web services manually for the change to take effect."
         return 1
     fi
 
-    while IFS= read -r service; do
-        [[ -n "$service" ]] || continue
-        services+=("$service")
-    done < <(
-        systemctl list-units --type=service --state=active --no-legend 2>/dev/null |
-            awk '$1 ~ /^(php.*fpm|httpd|apache2)\.service$/ {print $1}'
-    )
-
     if ((${#services[@]} == 0)); then
-        ui_warning "No active PHP-FPM or Apache/httpd service was found. Restart it manually if needed."
+        ui_warning "No active PHP-FPM, Apache/httpd or LiteSpeed service was found. Restart it manually if needed."
         return 1
     fi
 
     for service in "${services[@]}"; do
         ui_info "Restarting $service..."
-        if systemctl restart "$service"; then
+        if restart_service "$service"; then
             ui_success "$service restarted."
         else
             ui_warning "Could not restart $service."
@@ -1213,7 +1419,7 @@ restart_runtime_services() {
 
 offer_runtime_restart() {
     local answer
-    read -r -p "Restart active PHP-FPM/Apache services now? [y/N] " answer
+    read -r -p "Restart active PHP-FPM/Apache/LiteSpeed services now? [y/N] " answer
     case "${answer,,}" in
         y|yes) restart_runtime_services ;;
         *) ui_info "Services were not restarted; restart them before relying on the change." ;;
@@ -1289,42 +1495,52 @@ session.upload_progress.enabled = 0
     fi
 }
 
-collect_apt_php_packages() {
-    local package name version major minor
-    while IFS= read -r package; do
-        [[ -n "$package" ]] || continue
-        name="${package%%:*}"
-        if [[ "$name" =~ ^php([0-9]+)\.([0-9]+)(-|$) ]]; then
-            major=$((10#${BASH_REMATCH[1]}))
-            minor=$((10#${BASH_REMATCH[2]}))
-            ((major > 8 || (major == 8 && minor >= 2))) && printf '%s\n' "$package"
-        elif [[ "$name" =~ ^php(-|$) || "$name" =~ ^libapache2-mod-php(-|$) ]]; then
-            printf '%s\n' "$package"
-        fi
-    done < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null | sort -u)
+# Prints the PHP branch encoded in a package name: php8.3-* (Debian/Ubuntu),
+# php83-* (Remi, Alpine, Arch AUR) or ea-php83-* (cPanel EA).
+php_package_branch() {
+    local name="$1" digits
+    if [[ "$name" =~ ^php([0-9]+)\.([0-9]+)(-|$) ]]; then
+        printf '%d.%d\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))"
+    elif [[ "$name" =~ ^(ea-)?php([0-9]{2,3})(-|$) ]]; then
+        digits="${BASH_REMATCH[2]}"
+        printf '%d.%d\n' "$((10#${digits:0:${#digits}-1}))" "$((10#${digits: -1}))"
+    else
+        return 1
+    fi
 }
 
-collect_rpm_php_packages() {
-    local package major minor digits
+# Versioned PHP 8.2+ packages, plus the unversioned distribution packages:
+# php-* (Debian, RHEL, Arch), php8-* (openSUSE). Apache module packages
+# (libapache2-mod-php8.3, apache2-mod_php8) and LiteSpeed (lsphp83-*)
+# packages follow the same rules.
+php_package_selected() {
+    local name="${1#libapache2-mod-}" branch
+    name="${name#apache2-mod_}"
+    [[ "$name" == lsphp* ]] && name="${name#ls}"
+    if branch="$(php_package_branch "$name")"; then
+        version_at_least_82 "$branch"
+    else
+        [[ "$name" =~ ^php8?(-|$) ]]
+    fi
+}
+
+collect_php_packages() {
+    local package
     while IFS= read -r package; do
         [[ -n "$package" ]] || continue
-        if [[ "$package" =~ ^php([0-9])([0-9])-php ]]; then
-            major=$((10#${BASH_REMATCH[1]}))
-            minor=$((10#${BASH_REMATCH[2]}))
-            ((major > 8 || (major == 8 && minor >= 2))) && printf '%s\n' "$package"
-        elif [[ "$package" =~ ^ea-php([0-9]{2,3})- ]]; then
-            digits="${BASH_REMATCH[1]}"
-            major=$((10#${digits:0:${#digits}-1}))
-            minor=$((10#${digits: -1}))
-            ((major > 8 || (major == 8 && minor >= 2))) && printf '%s\n' "$package"
-        elif [[ "$package" =~ ^php(-|$) ]]; then
-            printf '%s\n' "$package"
-        fi
-    done < <(rpm -qa --qf '%{NAME}\n' 2>/dev/null | sort -u)
+        php_package_selected "${package%%:*}" && printf '%s\n' "$package"
+    done < <(
+        case "$1" in
+            apt) dpkg-query -W -f='${binary:Package}\n' ;;
+            dnf|yum|zypper) rpm -qa --qf '%{NAME}\n' ;;
+            apk) apk info ;;
+            pacman) pacman -Qq ;;
+        esac 2>/dev/null | sort -u
+    )
 }
 
 update_php_packages() {
-    local manager answer package_list package name major minor digits package_supports_82=0
+    local manager answer package_list package branch package_supports_82=0
     local packages=()
 
     if ((EUID != 0)); then
@@ -1336,17 +1552,21 @@ update_php_packages() {
 
     if command -v apt-get >/dev/null 2>&1 && command -v dpkg-query >/dev/null 2>&1; then
         manager="apt"
-        package_list="$(collect_apt_php_packages)"
     elif command -v dnf >/dev/null 2>&1 && command -v rpm >/dev/null 2>&1; then
         manager="dnf"
-        package_list="$(collect_rpm_php_packages)"
     elif command -v yum >/dev/null 2>&1 && command -v rpm >/dev/null 2>&1; then
         manager="yum"
-        package_list="$(collect_rpm_php_packages)"
+    elif command -v zypper >/dev/null 2>&1 && command -v rpm >/dev/null 2>&1; then
+        manager="zypper"
+    elif command -v apk >/dev/null 2>&1; then
+        manager="apk"
+    elif command -v pacman >/dev/null 2>&1; then
+        manager="pacman"
     else
-        ui_warning "No supported package manager was found. Supported managers: apt, dnf, and yum."
+        ui_warning "No supported package manager was found. Supported managers: apt, dnf, yum, zypper, apk, and pacman."
         return 1
     fi
+    package_list="$(collect_php_packages "$manager")"
 
     while IFS= read -r package; do
         [[ -n "$package" ]] && packages+=("$package")
@@ -1360,27 +1580,8 @@ update_php_packages() {
         package_supports_82=1
     else
         for package in "${packages[@]}"; do
-            name="${package%%:*}"
-            if [[ "$name" =~ ^php([0-9]+)\.([0-9]+)(-|$) ]]; then
-                major=$((10#${BASH_REMATCH[1]}))
-                minor=$((10#${BASH_REMATCH[2]}))
-                if ((major > 8 || (major == 8 && minor >= 2))); then
-                    package_supports_82=1
-                fi
-            elif [[ "$name" =~ ^php([0-9])([0-9])-php ]]; then
-                major=$((10#${BASH_REMATCH[1]}))
-                minor=$((10#${BASH_REMATCH[2]}))
-                if ((major > 8 || (major == 8 && minor >= 2))); then
-                    package_supports_82=1
-                fi
-            elif [[ "$name" =~ ^ea-php([0-9]{2,3})- ]]; then
-                digits="${BASH_REMATCH[1]}"
-                major=$((10#${digits:0:${#digits}-1}))
-                minor=$((10#${digits: -1}))
-                if ((major > 8 || (major == 8 && minor >= 2))); then
-                    package_supports_82=1
-                fi
-            fi
+            branch="$(php_package_branch "${package%%:*}" || true)"
+            version_at_least_82 "$branch" && package_supports_82=1
         done
     fi
     if ((package_supports_82 == 0)); then
@@ -1396,6 +1597,9 @@ update_php_packages() {
         echo "  - $package"
     done
     echo
+    if [[ "$manager" == pacman ]]; then
+        echo "Arch Linux does not support partial upgrades: this runs a full system upgrade (pacman -Syu)."
+    fi
     echo "The update may restart services through the package manager."
     read -r -p "Continue with the PHP package update? [y/N] " answer
     case "${answer,,}" in
@@ -1412,6 +1616,15 @@ update_php_packages() {
             ;;
         yum)
             yum update -y "${packages[@]}"
+            ;;
+        zypper)
+            zypper --non-interactive refresh && zypper --non-interactive update "${packages[@]}"
+            ;;
+        apk)
+            apk update && apk upgrade "${packages[@]}"
+            ;;
+        pacman)
+            pacman -Syu --noconfirm
             ;;
     esac
     if (($? != 0)); then
@@ -1462,8 +1675,8 @@ render_report() {
         print_table_upload_cell "$upload_status" 18 "$color"
         printf ' %-42.42s %s\n' "${PHP_PATHS[$i]}" "${SOURCES[$i]}"
         case "$status" in
-            AFFECTED) affected=$((affected + 1)) ;;
-            FIXED) fixed=$((fixed + 1)) ;;
+            AFFECTED*) affected=$((affected + 1)) ;;
+            FIXED*) fixed=$((fixed + 1)) ;;
             "NOT AFFECTED"*) not_affected=$((not_affected + 1)) ;;
             *) unknown=$((unknown + 1)) ;;
         esac
@@ -1556,7 +1769,7 @@ reset_scan_state() {
 
 run_scan() {
     reset_scan_state
-    ui_heading "SCANNING WHM / NGINX / APACHE"
+    ui_heading "SCANNING WHM / NGINX / APACHE / LITESPEED"
     local whm_found=0
     if command -v whmapi1 >/dev/null 2>&1; then
         if collect_whm; then
